@@ -1,0 +1,489 @@
+/* Inter Process Communication (IPC) between C# and C++
+ * 
+ * Warning 1. Passing data over IPC does not ensure it is retained. So make sure not to pass local copies of data
+ * Make sure they persist, otherwise they might go out of scope between handling the data in C# and sending it from C++
+ *
+ * Warning 2. Don't send sequential boolean values over IPC! C# and C++ handle these differently, messing up the marshalling
+ * My advice, use int values to avoid any chance of mixing this up, rather than just not sending them after another.
+ */
+
+// ************************************ C# ExternalIPC.cs *****************************************
+
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+/// <summary>
+/// Exposes C# functions, providing access through IPC to C++ implementations
+/// 
+/// Access hierarchy for external to internal:
+/// ExternalIPC.cs -> NativeMethods.cs -> SensorInterops.h/.cpp -> ActualCPPClass.h/.cpp
+/// </summary>
+namespace InteropsLibrary
+{
+    /// <summary>
+    /// Class to communicate with C++ <for your application>.
+    /// 
+    /// NOTE: Referenced content of this region from Frame.cs in Realsense project
+    /// HandleRef variable, Release function, IDisposable region, Marshaler class
+    /// </summary>
+    public class ExternalIPC : IDisposable
+    {
+        // Function pointers for complex generics
+        delegate T ActionRefArray1<T, U>(ref U myArray);
+        delegate T ActionRefArray2<T, U, V>(ref U myArray1, ref V myArray2);
+        
+        // Handle for IPC
+        internal HandleRef m_instance;
+        
+        // Returns whether sensor was properly validated and initialized
+        private static readonly ExternalIPC instance = new ExternalIPC();
+
+        // Note: constructor is 'private'
+        private ExternalIPC() { }
+
+        // Get Singleton instance
+        public static ExternalIPC GetInstance()
+        {
+            return instance;
+        }
+
+        #region IDisposable Support
+
+        private bool disposedValue = false; // To detect redundant calls
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (!disposedValue)
+            {
+                if (disposing)
+                {
+                    // TODO: dispose managed state (managed objects).
+                }
+
+                // TODO: free unmanaged resources (unmanaged objects) and override a finalizer below.
+                // TODO: set large fields to null.
+                //Release();
+                disposedValue = true;
+            }
+        }
+
+        // TODO: override a finalizer only if Dispose(bool disposing) above has code to free unmanaged resources.
+        ~ExternalIPC()
+        {
+            // Do not change this code. Put cleanup code in Dispose(bool disposing) above.
+            Dispose(false);
+        }
+
+        // This code added to correctly implement the disposable pattern.
+        public void Dispose()
+        {
+            // Do not change this code. Put cleanup code in Dispose(bool disposing) above.
+            Dispose(true);
+            // TODO: uncomment the following line if the finalizer is overridden above.
+            GC.SuppressFinalize(this);
+        }
+        #endregion
+
+        // Free sensor handle. Unused, added for completeness
+        public void Release()
+        {
+            m_instance = new HandleRef(this, IntPtr.Zero);
+        }
+
+        #region Dll Setup
+
+        /// <summary>
+        /// Create instance of sensor, store instance reference and check sensor status.
+        /// Includes debug output of initialisation and boolean for showing openCV windows.
+        /// </summary>
+        public void InitIPCHandle()
+        {
+            // Check if handle already exists
+            if (m_instance.Handle != IntPtr.Zero)
+                return;
+
+            // Set reference handle
+            m_instance = new HandleRef(this, NativeMethods.InitHandle());
+        }
+
+        #endregion
+        
+        #region Function Examples
+        
+        /// <summary> ... </summary>
+        public bool BasicFunction(int myInt)
+        {
+            if (!HandleValidated)
+                return false;
+
+            NativeMethods.BasicFunction(m_instance.Handle, myInt);
+            return true;
+        }
+        
+        /// <summary> ... </summary>
+        public bool SetSimpleStruct(MyStruct myStruct)
+        {
+            if (!HandleValidated)
+                return false;
+
+            NativeMethods.SetSimpleStruct(m_instance.Handle, myStruct);
+            return true;
+        }
+        
+        /// <summary> ... </summary>
+        public bool UpdateSimpleStruct(ref MyStruct myStruct)
+        {
+            if (!HandleValidated)
+                return false;
+                
+            bool success = false;
+            IntPtr myPtr = new IntPtr();
+            try
+            {
+                // Allocate unmanaged memory for MyStruct
+                myPtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(MyStruct)));
+                Marshal.StructureToPtr(myStruct, myPtr, false /*Don't erase struct*/);
+
+                // Internally updates the calibration settings and color cropping, then recalculates
+                // the cropped resolutions. Finally returns the updated tracker calibration settings
+                NativeMethods.UpdateCalibrationSettings(m_instance.Handle, ref myPtr);
+
+                // Assign returned data from unmanaged code
+                myStruct = (MyStruct)Marshal.PtrToStructure(myPtr, typeof(MyStruct));
+
+                success = true;
+            }
+            finally
+            {
+                // Free unmanaged memory
+                Marshal.FreeHGlobal(myPtr);
+            }
+            
+            return success;
+        }
+        
+        /// <summary> ... </summary>
+        public bool SetStructArray(List<MyStruct> myStructList)
+        {
+            if (!HandleValidated)
+                return false;
+
+            bool success = false;
+            IntPtr[] listPtr = new IntPtr[myStructList.Count];
+            try
+            {
+                // 2. Allocate unmanaged memory in a list of pointers per item
+                for (int i = 0; i < myStructList.Count; i++)
+                {
+                    listPtr[i] = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(MyStruct)));
+                    Marshal.StructureToPtr(myStructList[i], listPtr[i], false /*No need to erase struct*/);
+                }
+
+                // 3. Set color blobs to tracker
+                NativeMethods.SetStructArray(m_instance.Handle, listPtr, myStructList.Count);
+                success = true;
+            }
+            finally
+            {
+                // 4. Free unmanaged memory
+                for (int i = 0; i < listPtr.Length; i++)
+                    Marshal.FreeHGlobal(listPtr[i]);
+            }
+            return success;
+        }
+        
+        /// <summary> ... </summary>
+        public bool GetArrayData(ref List<MyStruct> myStructList)
+        {
+            if (!HandleValidated)
+                return false;
+
+            // Initialise variables
+            MyStruct tempStruct;
+            int structSizeBlobData = Marshal.SizeOf(typeof(MyStruct));
+
+            // Get MyStruct from tracker
+            NativeMethods.GetArrayData(m_instance.Handle, out IntPtr blobArrayData, out int blobCount);
+
+            // Recreate array of MyStruct from unmanaged code
+            for (int i = 0; i < blobCount; i++)
+            {
+                IntPtr data = new IntPtr(blobArrayData.ToInt64() + structSizeBlobData * i);
+                tempStruct = (MyStruct)Marshal.PtrToStructure(data, typeof(MyStruct));
+                myStructList.Add(tempStruct);
+            }
+
+            return true;
+        }
+        
+        /// <summary> ... </summary>
+        public bool GetArrayStruct1ArrayData(ref List<MyStruct> myStructList)
+        {
+            if (!HandleValidated)
+                return false;
+
+            // Initialize variables and get MyStruct
+            IntPtr debugOutput = NativeMethods.GetArrayStruct1ArrayData(m_instance.Handle,
+                out IntPtr myData1Array,      out int myData1ArrayCount,
+                out IntPtr myData1SizesArray, out int myData1SizesArrayCount);
+
+            // Clear old data
+            myStructList.Clear();
+
+            // Assign function to function variable to be called during filled of struct
+            ActionRefArray1<MyStruct, Point_2f[]> myFuncVar = FillMyStructA;
+            
+            // Have given struct filled with data from C++
+            FillStructList_1(ref myStructList, myFuncVar,
+                ref myDataArray, ref myDataArrayCount, ref myDataSizesArray, ref myDataSizesArrayCount);
+
+            return true;
+        }
+
+        /// <summary> ... </summary>
+        public bool GetArrayStruct2ArrayData(ref List<MyStruct> myStructList)
+        {
+            if (!HandleValidated)
+                return false;
+
+            // 2. Initialize variables and get MyStruct from tracker
+            NativeMethods.GetArrayStruct2ArrayData(m_instance.Handle,
+                out IntPtr myData1Array,      out int myData1ArrayCount,
+                out IntPtr myData1SizesArray, out int myData1SizesArrayCount,
+                out IntPtr myData2Array,      out int myData2ArrayCount,
+                out IntPtr myData2SizesArray, out int myData2SizesArrayCount,
+                );
+
+            // Clear old data
+            myStructList.Clear();
+
+            // Assign function to function variable to be called during filled of struct
+            ActionRefArray2<MyStruct, char[], Point_2f[]> myFuncVar = FillMyStructB;
+            
+            // Have given struct filled with data from C++
+            FillStructList_2(ref myStructList, myFuncVar,
+                ref myData1Array, ref myData1ArrayCount, ref myData1SizesArray, ref myData1SizesArrayCount,
+                ref myData2Array, ref myData2ArrayCount, ref myData2SizesArray, ref myData2SizesArrayCount);
+
+            return true;
+        }
+        
+        #endregion
+
+
+// ************************************ C# NativeMethods.cs ************************************
+
+/* The following code contains various examples of possible functions for sending and receiving
+ * data between C# and C++
+ */
+
+using System;
+using System.Runtime.InteropServices;
+
+internal static class NativeMethods
+{
+    public const string dllName = "MyDllName";
+    
+    // Info on marshalling strings: https://docs.microsoft.com/en-us/dotnet/framework/interop/default-marshaling-for-strings
+    // Info on marshalling arrays:  https://docs.microsoft.com/en-us/dotnet/framework/interop/marshaling-different-types-of-arrays
+    
+    // NOTE: Boolean values are passed as int. Multiple consecutive booleans cause problems due to C# - C++ interpretation differences
+
+    // Dll setup
+    [DllImport(dllName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern IntPtr InitHandle();
+    
+    // Basic call
+    [DllImport(dllName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void BasicFunction(IntPtr handleRef, int myValue);
+    
+    // Set simple struct
+    [DllImport(dllName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void SetSimpleStruct(IntPtr handleRef, MyStruct setStruct);
+    
+    // Update simple struct
+    [DllImport(dllName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void UpdateSimpleStruct(IntPtr handleRef, ref IntPtr setStruct);
+    
+    // Set array data
+    [DllImport(dllName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void SetStructArray(IntPtr handleRef, IntPtr[] newStructArray, int newArraySize);
+    
+    // Get 1D array data - CharSet Ansi needed?
+    [DllImport(dllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    internal static extern void GetArrayData(IntPtr handleRef, out IntPtr arrayData, out int arraySize);
+
+    // Get 1D array for a struct array - CharSet Ansi needed?
+    // See extra documentation on using this function to receive dynamic arrays over IPC
+    [DllImport(dllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    internal static extern IntPtr GetArrayStruct1ArrayData(IntPtr handleRef,
+        out IntPtr elements1Array, out int elements1Count,
+        out IntPtr elements1SizesArray, out int elements1SizesArrayCount);
+
+    // Get 2 1D arrays for a struct array - CharSet Ansi needed?
+    // See extra documentation on using this function to receive dynamic arrays over IPC
+    [DllImport(dllName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    internal static extern IntPtr GetArrayStruct2ArrayData(IntPtr handleRef,
+        out IntPtr elements1Array, out int elements1Count,
+        out IntPtr elements1SizesArray, out int elements1SizesArrayCount,
+        out IntPtr elements2Array, out int elements2Count,
+        out IntPtr elements2SizesArray, out int elements2SizesArrayCount);
+}
+
+
+// ************************************ C++ MyInterops.h *****************************************
+#ifndef MY_INTEROPS_H
+#define MY_INTEROPS_H
+
+#include "ActualCPPClass.h"
+
+// Prevent name mangling of C++
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+    // ************** CPP ENTRY CLASS FOR MARSHALLING **************
+
+    typedef struct handle_ref handle_ref;
+    // Default zero return value
+    int zeroValue = 0;
+    int* zeroPtr = &zeroValue;
+    // Default debug return value (better to use vector<char> setup?)
+    std::string invalidRefTextStd = "Reference not set";
+    const char* invalidRefText = invalidRefTextStd.c_str();
+
+    // Dll setup
+    __declspec(dllexport) handle_ref* InitHandle();
+    
+    // Basic call
+    __declspec(dllexport) void BasicFunction(handle_ref* ref, int myValue);
+    
+    // Set simple struct
+    __declspec(dllexport) void SetSimpleStruct(handle_ref* ref, MyStruct* setStruct);
+    
+    // Update simple struct (set and get)
+    __declspec(dllexport) void UpdateSimpleStruct(handle_ref* ref, MyStruct** refStruct);
+    
+    // Set struct array
+    __declspec(dllexport) void SetStructArray(handle_ref* ref, MyStruct** structArray, int arraySize);
+
+    // Get 1D array data
+    __declspec(dllexport) void GetArrayData(handle_ref* ref, MyStruct** structArray, int* arraySize);
+    
+    // Get 1D array for a struct array (with a pointer to return debug text)
+    __declspec(dllexport) const char* GetArrayStruct1ArrayData(handle_ref* ref,
+        MyStruct** elements1Array, int* elements1Count,             // Flattened 2D MyStruct array
+        int** elements1SizesArray, int* elements1SizesArrayCount);  // Array of sizes
+        
+    // Get 2 1D arrays for a struct array
+    __declspec(dllexport) void GetArrayStruct2ArrayData(handle_ref* ref,
+        MyStruct** elements1Array, int* elements1Count,             // Flattened 2D MyStruct array
+        int** elements1SizesArray, int* elements1SizesArrayCount,   // Array of sizes
+        MyStruct** elements2Array, int* elements2Count,             // Flattened 2D MyStruct array
+        int** elements2SizesArray, int* elements2SizesArrayCount);  // Array of sizes
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // INTEROPS_TRACKER_H
+
+// ************************************ C++ MyDefines.h ********************************************
+
+#pragma once
+
+#define RUN_DLL 1
+/* Switching between console and dll, using Visual Studio (2017)
+ * Go to 'Project' -> 'BeweegvloerTracker Properties' under 'General', change the following calibrationSettings:
+ *                          RUN_DLL 0               RUN_DLL 1
+ * - Target Extension:      '.exe' (console)        '.dll' (dll)
+ * - Configuration Type:    'Application (.exe)'    'Dynamic Library (.dll)'
+ */
+
+// ************************************ C++ MyInterops.cpp *****************************************
+
+#pragma once
+
+#include "MyInterops.h"
+
+#if RUN_DLL != 1
+// Console application entry point, used for debugging C++ side
+int main(void)
+{
+    ActualCPPClass& myClass = ActualCPPClass::getInstance();
+    myClass.RunConsole(true);
+
+    return EXIT_SUCCESS;
+}
+#endif
+
+/// Struct to contain shared pointer to ActualCPPClass
+struct handle_ref
+{
+    std::shared_ptr<ActualCPPClass> shrPtrHandle;
+};
+
+/// Create reference to ActualCPPClass and do setup if needed
+handle_ref* InitHandle()
+{
+    // Initialize handle_ref
+    handle_ref* ref = new handle_ref{ std::make_shared<ActualCPPClass>() };
+    
+    if (ref != nullptr)
+        // Do further setup after calling ctor of ActualCPPClass
+        ref->shrPtrHandle->DoSetup();
+        
+    // Return reference to handle, to be used by subsequent calls to IPC
+    return ref;
+}
+
+/// Set basic value type
+void BasicFunction(handle_ref* ref, int myValue)
+{
+    ref->shrPtrSensor->BasicFunction(myValue);
+}
+
+/// Set simple struct
+void SetSimpleStruct(handle_ref* ref, MyStruct* setStruct)
+{
+    ref->shrPtrSensor->SetSimpleStruct(setStruct);
+}
+
+/// Update simple struct
+void UpdateSimpleStruct(handle_ref* ref, MyStruct** setStruct)
+{
+    ref->shrPtrSensor->UpdateSimpleStruct(setStruct);
+}
+
+/// Set struct array
+void SetStructArray(handle_ref* ref, MyStruct** structArray, int arraySize)
+{
+    ref->shrPtrSensor->SetStructArray(structArray, arraySize);
+}
+
+// Get 1D array data
+void GetArrayData(handle_ref* ref, MyStruct** structArray, int* arraySize)
+{
+    ref->shrPtrSensor->GetArrayData(structArray, arraySize);
+}
+
+/// Get 1D array for a struct array
+void GetArrayStruct1ArrayData(handle_ref* ref,
+    MyStruct** elements1Array, int* elements1Count, int** elements1SizesArray, int* elements1SizesArrayCount)
+{
+    return ref->shrPtrSensor->GetArrayStruct1ArrayData(
+        elements1Array, elements1Count, elements1SizesArray, elements1SizesArrayCount);
+}
+
+/// Get 2 1D arrays for a struct array
+void GetArrayStruct2ArrayData(handle_ref* ref,
+    MyStruct** elements1Array, int* elements1Count, int** elements1SizesArray, int* elements1SizesArrayCount,
+    MyStruct** elements2Array, int* elements2Count, int** elements2SizesArray, int* elements2SizesArrayCount)
+{
+    ref->shrPtrSensor->GetArrayStruct2ArrayData(
+        elements1Array, elements1Count, elements1SizesArray, elements1SizesArrayCount,
+        elements2Array, elements2Count, elements2SizesArray, elements2SizesArrayCount);
+}
+
+
